@@ -1,6 +1,6 @@
 import AppKit
 
-/// CleanShot X風：撮った画像を画面の左下にサムネイルで積んでおく
+/// CleanShot X風：撮った画像を画面の左下に束ねて置く。クリックで最大4枚に広げる
 @MainActor
 final class Overlay {
     static let shared = Overlay()
@@ -11,10 +11,14 @@ final class Overlay {
     var onEdit: ((Shot) -> Void)?
 
     private var panels: [NSPanel] = []
+    private var expanded = false
+    private var hovered = 0
+    private var collapseTimer: Timer?
     private let maxItems = 4
     private let width: CGFloat = 220
     private let margin: CGFloat = 16
     private let spacing: CGFloat = 10
+    private let peek: CGFloat = 7   // 束ねたとき、後ろの1枚がのぞく高さ
 
     func add(_ shot: Shot) {
         if panels.count >= maxItems { close(panels[0]) }
@@ -40,9 +44,12 @@ final class Overlay {
         }
         view.onSend = { [weak self] t in self?.onSend?(shot, t) }
         view.onEdit = { [weak self] in self?.onEdit?(shot) }
+        view.onClick = { [weak self] in self?.toggle() }
+        view.onHover = { [weak self] inside in self?.hoverChanged(inside) }
         panel.contentView = view
 
-        // 画面左外から滑り込ませる
+        // 新しく撮ったら束ねる。画面左外から滑り込ませる
+        expanded = false
         panels.append(panel)
         let frames = targetFrames()
         if var start = frames[ObjectIdentifier(panel)] {
@@ -50,13 +57,13 @@ final class Overlay {
             panel.setFrame(start, display: false)
         }
         panel.alphaValue = 0
-        panel.orderFrontRegardless()
         layout(frames)
     }
 
     func close(_ panel: NSPanel) {
         guard let i = panels.firstIndex(of: panel) else { return }
         panels.remove(at: i)
+        if panels.count <= 1 { expanded = false }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.18
             panel.animator().alphaValue = 0
@@ -70,30 +77,67 @@ final class Overlay {
         for p in panels { close(p) }
     }
 
+    /// クリックで 広げる ⇄ 束ねる
+    func toggle() {
+        guard panels.count > 1 else { return }
+        expanded.toggle()
+        layout(targetFrames())
+    }
+
+    /// 広げたまま放置しない。マウスが離れて少したったら束ね直す
+    private func hoverChanged(_ inside: Bool) {
+        hovered = max(0, hovered + (inside ? 1 : -1))
+        collapseTimer?.invalidate()
+        guard expanded, hovered == 0 else { return }
+        collapseTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.expanded, self.hovered == 0 else { return }
+                self.expanded = false
+                self.layout(self.targetFrames())
+            }
+        }
+    }
+
     private func screen() -> NSScreen? {
         NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main
     }
 
-    /// 新しいものほど下。上へ積み上げる
+    /// 広げたとき：新しいものほど下に積む。束ねたとき：最新を手前、古いものは上端だけ少しのぞかせる
     private func targetFrames() -> [ObjectIdentifier: NSRect] {
-        guard let vf = screen()?.visibleFrame else { return [:] }
+        guard let vf = screen()?.visibleFrame, let front = panels.last else { return [:] }
         var result: [ObjectIdentifier: NSRect] = [:]
+        let x = vf.minX + margin
         var y = vf.minY + margin
-        for p in panels.reversed() {
+        let frontTop = y + front.frame.height
+        for (i, p) in panels.reversed().enumerated() {
             let size = p.frame.size
-            result[ObjectIdentifier(p)] = NSRect(x: vf.minX + margin, y: y, width: size.width, height: size.height)
-            y += size.height + spacing
+            if expanded {
+                result[ObjectIdentifier(p)] = NSRect(x: x, y: y, width: size.width, height: size.height)
+                y += size.height + spacing
+            } else {
+                let inset = CGFloat(i) * 8
+                let top = frontTop + CGFloat(min(i, 2)) * peek
+                result[ObjectIdentifier(p)] = NSRect(x: x + inset / 2, y: top - size.height,
+                                                     width: size.width, height: size.height)
+            }
         }
         return result
     }
 
     private func layout(_ frames: [ObjectIdentifier: NSRect]) {
+        // 重なり順：新しいものほど手前
+        for p in panels { p.orderFrontRegardless() }
+        let front = panels.last
+        for (i, p) in panels.reversed().enumerated() {
+            p.ignoresMouseEvents = !expanded && p !== front
+            (p.contentView as? ThumbnailView)?.setBadge(!expanded && i == 0 && panels.count > 1 ? panels.count : 0)
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.25
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            for p in panels {
+            for (i, p) in panels.reversed().enumerated() {
                 if let f = frames[ObjectIdentifier(p)] { p.animator().setFrame(f, display: true) }
-                p.animator().alphaValue = 1
+                p.animator().alphaValue = expanded || i == 0 ? 1 : (i < 3 ? 0.9 : 0)
             }
         }
     }
@@ -108,8 +152,11 @@ final class ThumbnailView: NSView, NSDraggingSource {
     var onClose: (() -> Void)?
     var onSend: ((Target?) -> Void)?
     var onEdit: (() -> Void)?
+    var onClick: (() -> Void)?
+    var onHover: ((Bool) -> Void)?
 
     private let shot: Shot
+    private let badge = NoHitLabel(labelWithString: "")
     private let image: NSImage
     private let hover = PassThroughView()
     private var downEvent: NSEvent?
@@ -167,6 +214,23 @@ final class ThumbnailView: NSView, NSDraggingSource {
             label.bottomAnchor.constraint(equalTo: hover.bottomAnchor, constant: -6),
         ])
 
+        // 束ねているときの枚数バッジ（左上）
+        badge.font = .systemFont(ofSize: 11, weight: .bold)
+        badge.textColor = .white
+        badge.alignment = .center
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        badge.layer?.cornerRadius = 9
+        badge.isHidden = true
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(badge)
+        NSLayoutConstraint.activate([
+            badge.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            badge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            badge.heightAnchor.constraint(equalToConstant: 18),
+            badge.widthAnchor.constraint(greaterThanOrEqualToConstant: 18),
+        ])
+
         addTrackingArea(NSTrackingArea(
             rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: self, userInfo: nil))
@@ -193,14 +257,26 @@ final class ThumbnailView: NSView, NSDraggingSource {
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseEntered(with event: NSEvent) { hover.isHidden = false }
-    override func mouseExited(with event: NSEvent) { hover.isHidden = true }
+    override func mouseEntered(with event: NSEvent) { hover.isHidden = false; onHover?(true) }
+    override func mouseExited(with event: NSEvent) { hover.isHidden = true; onHover?(false) }
+
+    /// 0 なら非表示
+    func setBadge(_ n: Int) {
+        badge.stringValue = "\(n)"
+        badge.isHidden = n == 0
+    }
 
     // MARK: - クリック・ドラッグ
 
     override func mouseDown(with event: NSEvent) {
         downEvent = event
         if event.clickCount == 2 { NSWorkspace.shared.open(shot.fileURL) }  // ダブルクリックでプレビュー
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // ドラッグせずに1回クリック → 広げる／束ねる
+        if downEvent != nil && event.clickCount == 1 { onClick?() }
+        downEvent = nil
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -281,4 +357,9 @@ final class PassThroughView: NSView {
 
 final class FirstMouseButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+/// クリックを下のサムネイルに通すラベル
+final class NoHitLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

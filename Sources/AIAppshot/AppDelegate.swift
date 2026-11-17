@@ -229,6 +229,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 MainActor.assumeIsolated { Overlay.shared.add(shot) }
             }
         }
+        // --expand を付けると、少しあとで広げた状態も確認できる
+        if CommandLine.arguments.contains("--expand") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                MainActor.assumeIsolated { Overlay.shared.toggle() }
+            }
+        }
     }
 
     /// サムネイルの「送る」から
